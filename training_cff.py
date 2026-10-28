@@ -16,18 +16,14 @@ except ImportError:
 
 STEPS = 400000
 EVAL_EVERY = 2500
-DX = (2.0 * np.pi) / 63
-DY = (2.0 * np.pi) / 63
-DZ = (2.0 * np.pi) / 63
 N_PDE = 24576
 N_BC = 2024
-W_FF = 1.0
+W_CUR = 1.0
 W_DIV = 1.0
 W_BC = 10.0
+W_TOP = 1.0
 # Interior sampling density ratio (bottom : top)
 Z_RATIO = 10.0
-# Physical magnetic-field value added to the force-free denominator
-EPS_PHYS = 0.1
 # Learning-rate parameters
 LR_MAX = 1e-3
 LR_MIN = 1e-4
@@ -42,39 +38,6 @@ SEED = 1234
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_EVERY = 50_000
 MODEL_ROOT = Path("/gwork0/yokoyakd/PINN_cff/model")
-
-class PINN_NN(nn.Module):
-    
-    def __init__(self, x0, y0, z0, width = 128, depth = 5, lb = 0, ub = 63):
-        super().__init__()
-        self.x0 = x0
-        self.y0 = y0
-        self.z0 = z0
-        self.lb = lb
-        self.ub = ub
-
-        #ネットの作成
-        in_dim = 3  #x, y, z
-        layers = []
-        layers.append(nn.Linear(in_dim, width))
-        layers.append(nn.Tanh())
-        for _ in range(depth - 1):
-            layers.append(nn.Linear(width, width))
-            layers.append(nn.Tanh())
-        layers.append(nn.Linear(width, 3))  # Bx, By, Bz
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x, y, z):
-
-        lb = self.lb
-
-        x = 2.0*(x - lb)/(self.x0 - lb) - 1.0
-        y = 2.0*(y - lb)/(self.y0 - lb) - 1.0
-        z = 2.0*(z - lb)/(self.z0 - lb) - 1.0
-
-        inp = torch.cat([x, y, z], dim=1)
-
-        return self.net(inp)
 
 def make_multimode_bottom_bz(nx: int = 64, ny: int = 64, lx: float = 2.0 * np.pi, ly: float = 2.0 * np.pi,) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
     x = np.linspace(0.0, lx, nx, endpoint=False)
@@ -171,13 +134,17 @@ class PINN_NN(nn.Module):
     
     def __init__(self, Lx, Ly, Lz, width=128, depth=5):
         super().__init__()
-        self.s = max(Lx, Ly, Lz)
-        dims = [3] + [width] * depth
+        self.Lx, self.Ly, self.Lz = Lx, Ly, Lz
+        # x, y は sin/cos で入力して水平周期境界を厳密に満たす: sin x, cos x, sin y, cos y, z
+        dims = [5] + [width] * depth
         self.hidden = nn.ModuleList(nn.Linear(i, o) for i, o in zip(dims[:-1], dims[1:]))
         self.out = nn.Linear(width, 3)
 
     def forward(self, x, y, z):
-        h = 2.0 * torch.cat([x, y, z], dim=1) / self.s - 1.0
+        xx = 2.0 * np.pi * x / self.Lx
+        yy = 2.0 * np.pi * y / self.Ly
+        zz = 2.0 * z / self.Lz - 1.0
+        h = torch.cat([torch.sin(xx), torch.cos(xx), torch.sin(yy), torch.cos(yy), zz], dim=1)
         for lin in self.hidden:
             h = torch.tanh(lin(h))
         return self.out(h)
@@ -191,81 +158,55 @@ def curl_and_div(B, x, y, z):
     J = torch.cat([d[2][1] - d[1][2], d[0][2] - d[2][0], d[1][0] - d[0][1]], dim=-1)
     return J, d[0][0] + d[1][1] + d[2][2]
 
-def current_free_losses(model, x, y, z, eps=1.0e-8):
+def current_free_losses(model, x, y, z):
     B = model(x, y, z)
     J, div_b = curl_and_div(B, x, y, z)
-    Bm = B.detach().norm(dim=-1) + eps
-
-    loss_ff =  (torch.sum(torch.cross(J, B, dim=-1) ** 2, dim=-1) * Bm ** -4.0).mean()
+    # |J|^2  (ポテンシャル場の条件は J = 0。J x B = 0 (force-free) ではない)
+    loss_cur = torch.mean(torch.sum(J**2, dim=-1))
     # |div B|^2
-    loss_div = torch.mean(div_b**2 * Bm ** -2.0)
+    loss_div = torch.mean(div_b**2)
 
-    return loss_ff, loss_div
+    return loss_cur, loss_div
 
 
 class Bottom:
-    def __init__(self, b0, dx, dy, B0, device):
-        self.g = torch.as_tensor(b0 / B0, dtype=torch.float32, device=device)  # (nx, ny, 3)
-        self.dx, self.dy = dx, dy                                             # 無次元の格子幅
+    """底面 Bz の周期的な双線形補間。格子点 i は x = i * dx (i = 0..nx-1)、x = nx * dx は i = 0 と同じ点。"""
+    def __init__(self, bz0, dx, dy, B0, device):
+        self.g = torch.as_tensor(bz0 / B0, dtype=torch.float32, device=device)  # (nx, ny)
+        self.dx, self.dy = dx, dy                                              # 無次元の格子幅
 
     def __call__(self, x, y):
-        nx, ny = self.g.shape[:2]
-        gx = (x / self.dx).clamp(0, nx - 1).squeeze(-1)
-        gy = (y / self.dy).clamp(0, ny - 1).squeeze(-1)
-        i0 = gx.floor().long().clamp(max=nx - 2)
-        j0 = gy.floor().long().clamp(max=ny - 2)
+        nx, ny = self.g.shape
+        gx = (x / self.dx).squeeze(-1)
+        gy = (y / self.dy).squeeze(-1)
+        i0 = gx.floor().long()
+        j0 = gy.floor().long()
         tx = (gx - i0)[:, None]
         ty = (gy - j0)[:, None]
-        g = self.g
-        return ((1 - tx) * (1 - ty) * g[i0, j0] + tx * (1 - ty) * g[i0 + 1, j0]
-                + (1 - tx) * ty * g[i0, j0 + 1] + tx * ty * g[i0 + 1, j0 + 1])
+        i0, j0 = i0 % nx, j0 % ny
+        i1, j1 = (i0 + 1) % nx, (j0 + 1) % ny
+        g = self.g[..., None]
+        return ((1 - tx) * (1 - ty) * g[i0, j0] + tx * (1 - ty) * g[i1, j0]
+                + (1 - tx) * ty * g[i0, j1] + tx * ty * g[i1, j1])
 
 
 
 def make_points(n, lx, ly, lz, device):
-    x = torch.rand(n, 1, device=device, requires_grad=True)
-    y = torch.rand(n, 1, device=device, requires_grad=True)
-    z = torch.rand(n, 1, device=device, requires_grad=True)
+    x = (lx * torch.rand(n, 1, device=device)).requires_grad_(True)
+    y = (ly * torch.rand(n, 1, device=device)).requires_grad_(True)
+    z = (lz * torch.rand(n, 1, device=device)).requires_grad_(True)
     return x, y, z
 
 
 def make_points_near_top(n, lx, ly, lz, device, thickness=0.2):
-    x = torch.rand(n, 1, device=device, requires_grad=True)
-    y = torch.rand(n, 1, device=device, requires_grad=True)
+    x = (lx * torch.rand(n, 1, device=device)).requires_grad_(True)
+    y = (ly * torch.rand(n, 1, device=device)).requires_grad_(True)
 
     # z in [(1-thickness)*lz, lz]
-    z = (1.0 - thickness * torch.rand(n, 1, device=device))
+    z = lz * (1.0 - thickness * torch.rand(n, 1, device=device))
     z.requires_grad_(True)
 
     return x, y, z
-
-def Cov_weighting(itr, Lt1, Lt2, Lt3,l1, l2, l3):
-    if itr == 0:
-        return [0.0025, 0.0025, 0.995]
-        
-    else:
-        lt1 = Lt1[itr]/np.mean(Lt1[:itr])
-        lt2 = Lt2[itr]/np.mean(Lt2[:itr])
-        lt3 = Lt3[itr]/np.mean(Lt3[:itr])
-
-        l1.append(lt1)
-        l2.append(lt2)
-        l3.append(lt3)
-
-        if itr > 5:
-            clt1 = np.std(l1)/np.mean(l1)
-            clt2 = np.std(l2)/np.mean(l2)
-            clt3 = np.std(l3)/np.mean(l3)
-            zt = clt1 + clt2 + clt3 
-
-            weight1 = (1/zt)*clt1
-            weight2 = (1/zt)*clt2
-            weight3 = (1/zt)*clt3
-
-            return [weight1, weight2, weight3]
-
-        else:
-            return [0.0025, 0.0025, 0.995]
 
 def lr_at(step):
     """学習率（tanh 型）。ステップ数だけで決まり、総ステップ数には依存しない。"""
@@ -290,17 +231,17 @@ def open_loss_log(run_dir):
     path = Path(run_dir) / "loss.txt"
     f = path.open("w", encoding="utf-8")
     f.write(
-        "total_loss\tjxb\tdivB\tbottom_bz\t"
-        "weight_jxb\tweight_divB\tweight_bottom\tlr\n"
+        "total_loss\tcurrent\tdivB\tbottom_bz\ttop_h\t"
+        "weight_current\tweight_divB\tweight_bottom\tlr\n"
     )
     f.flush()
     return f
 
 
-def log_step(loss_file, step_num, total_loss, loss_jxb, loss_div, loss_bottom, weights_used, lr):
+def log_step(loss_file, step_num, total_loss, loss_cur, loss_div, loss_bottom, loss_top, weights_used, lr):
     """Write one row for each completed optimizer step and flush immediately."""
     vals = [
-        total_loss, loss_jxb, loss_div, loss_bottom,
+        total_loss, loss_cur, loss_div, loss_bottom, loss_top,
         weights_used[0], weights_used[1], weights_used[2], lr,
     ]
     loss_file.write(str(vals[0]) + "\t" + "\t".join(f"{float(v):.12e}" for v in vals[1:]) + "\n")
@@ -343,43 +284,32 @@ def save_executed_kernel_code(run_dir, source_file=None):
     print(f"Saved Python source to: {out.resolve()}")
     return out
 
-def train(b0_grid, lx, ly, lz, z, steps=STEPS, n_pde=N_PDE, n_bc=N_BC, device="cuda", run_dir = None):
-    b0 = torch.as_tensor(b0_grid, dtype=torch.float32, device=device)
-    _, bx_ref, by_ref, bz_ref = solve_potential_field_fft_cartesian_at_z(b0_grid=b0_grid, lx=lx, ly=ly, lz=lz, z=z,)
-    B_ref = np.stack([bx_ref, by_ref, bz_ref], axis=-1)
-    nx, ny, nz = bx_ref.shape[:3]
-    B0 = float(np.sqrt(np.mean(np.sum(B_ref**2, axis=-1)))) 
+def train(b0_grid, lx, ly, lz, steps=STEPS, n_pde=N_PDE, n_bc=N_BC, device="cuda", run_dir = None):
+    # b0_grid: 底面 Bz, shape (nx, ny), x = i * lx / nx (endpoint=False の周期格子)
+    nx, ny = b0_grid.shape
+    # 規格化は入力データ(底面 Bz)だけで決める。参照解は使わない
+    B0 = float(np.sqrt(np.mean(b0_grid**2)))
     print(B0)
-    L0 = lx 
+    L0 = lx
 
-    Lx, Ly, Lz = (nx - 1) * DX / L0, (ny - 1) * DY / L0, (nz - 1) * DZ / L0  
-    h = (DX / L0, DY / L0, DZ / L0)  
-    eps = EPS_PHYS / B0
+    Lx, Ly, Lz = lx / L0, ly / L0, lz / L0
+    h = (Lx / nx, Ly / ny)   # 周期格子なので (n - 1) ではなく n で割る
 
-    bottom = Bottom(B_ref[:, :, 0, :], h[0], h[1], B0, DEVICE)
+    bottom = Bottom(b0_grid, h[0], h[1], B0, device)
     model = PINN_NN(Lx, Ly, Lz).to(device)
 
     a = 1.0 - 1.0 / np.sqrt(Z_RATIO)
     c = 1.0 - (1.0 - a) ** 3
 
     def rand(n, L):
-        return (0.0 + 1.0 * torch.rand(n, 1, device=DEVICE)) * L
+        return (0.0 + 1.0 * torch.rand(n, 1, device=device)) * L
 
     def rand_z(n):
-        u = torch.rand(n, 1, device=DEVICE)
+        u = torch.rand(n, 1, device=device)
         return (1.0 - (1.0 - c * u) ** (1.0 / 3.0)) / a * Lz
 
-    
-    Lt1 = []
-    Lt2 = []
-    Lt3 = []
+    weight = [W_CUR, W_DIV, W_BC]
 
-    l1 = []
-    l2 = []
-    l3 = []
-
-    weight = [0.0025, 0.0025, 0.995]
- 
     opt = torch.optim.Adam(model.parameters(), lr=LR_MAX)
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: lr_at(step) / LR_MAX)
 
@@ -389,39 +319,35 @@ def train(b0_grid, lx, ly, lz, z, steps=STEPS, n_pde=N_PDE, n_bc=N_BC, device="c
 
     for step in range(steps):
         opt.zero_grad()
-        x, y, z = make_points(N_PDE, Lx, Ly, Lz, device)
-        xti, yti, zti = make_points_near_top(N_PDE // 2, Lx, Ly, Lz, device)
+        x, y, z = make_points(n_pde, Lx, Ly, Lz, device)
+        xti, yti, zti = make_points_near_top(n_pde // 2, Lx, Ly, Lz, device)
 
 
-        xb, yb = rand(N_BC, Lx), rand(N_BC, Ly)
-        zb = torch.zeros(n_bc, 1, device=device, requires_grad=True)
+        xb, yb = rand(n_bc, Lx), rand(n_bc, Ly)
+        zb = torch.zeros(n_bc, 1, device=device)
 
         # ---- Interior current-free and divB losses ----
 
-        loss_jxb, loss_div = current_free_losses(model, x, y, z, eps)
-        loss_jxb_t, loss_div_t = current_free_losses(model, xti, yti, zti, eps)
-        loss_jxb = loss_jxb + loss_jxb_t
-        loss_div_t = loss_div + loss_div_t
+        loss_cur, loss_div = current_free_losses(model, x, y, z)
+        loss_cur_t, loss_div_t = current_free_losses(model, xti, yti, zti)
+        loss_cur = loss_cur + loss_cur_t
+        loss_div = loss_div + loss_div_t
 
         # ---- Bottom boundary: Bz = B0 ----
-
+        # 観測量は底面の Bz だけなので Bx, By は教師にしない
 
         bottom_pred = model(xb, yb, zb)
         g = bottom(xb, yb)
+        loss_bottom = torch.mean((bottom_pred[:, 2:3] - g) ** 2)
 
-        loss_bottom_x = torch.sum((bottom_pred[:, 0] -  g[:, 0]) ** 2, dim = -1).mean()
-        loss_bottom_y = torch.sum((bottom_pred[:, 1] -  g[:, 1]) ** 2, dim = -1).mean()
-        loss_bottom_z = torch.sum((bottom_pred[:, 2] -  g[:, 2]) ** 2, dim = -1).mean()
-        loss_bottom = 0.05*loss_bottom_x + 0.05*loss_bottom_y + 0.9*loss_bottom_z
+        # ---- Top boundary: Bx = By = 0 (psi = 0, FFT 参照解と同じ条件) ----
+
+        top_pred = model(xb, yb, torch.full_like(zb, Lz))
+        loss_top = torch.mean(torch.sum(top_pred[:, :2] ** 2, dim=-1))
 
         weights_used = tuple(weight)
         # ---- Total loss ----
-        loss = (weight[0] * loss_jxb +  weight[1] * loss_div + weight[2] * loss_bottom )
-
-        Lt1.append(loss_jxb.item())
-        Lt2.append(loss_div.item())
-        Lt3.append(loss_bottom.item())
-        weight = Cov_weighting(step, Lt1, Lt2, Lt3,l1, l2, l3,)
+        loss = (weight[0] * loss_cur + weight[1] * loss_div + weight[2] * loss_bottom + W_TOP * loss_top)
 
         loss.backward()
         opt.step()
@@ -429,7 +355,7 @@ def train(b0_grid, lx, ly, lz, z, steps=STEPS, n_pde=N_PDE, n_bc=N_BC, device="c
 
         step_num = step + 1
 
-        log_step(loss_file, step_num, loss.item(), loss_jxb.item(), loss_div.item(), loss_bottom.item(), weights_used, opt.param_groups[0]["lr"],)
+        log_step(loss_file, step_num, loss.item(), loss_cur.item(), loss_div.item(), loss_bottom.item(), loss_top.item(), weights_used, opt.param_groups[0]["lr"],)
 
         if step_num % CHECKPOINT_EVERY == 0:
             save_checkpoint(model, run_dir, step_num)
@@ -439,9 +365,10 @@ def train(b0_grid, lx, ly, lz, z, steps=STEPS, n_pde=N_PDE, n_bc=N_BC, device="c
                 step,
                 {
                     "loss": float(loss.detach().cpu()),
-                    "jxb": float(loss_jxb.detach().cpu()),
+                    "current": float(loss_cur.detach().cpu()),
                     "divB": float(loss_div.detach().cpu()),
-                    "bottom_bz": float(loss_bottom.detach().cpu())
+                    "bottom_bz": float(loss_bottom.detach().cpu()),
+                    "top_h": float(loss_top.detach().cpu()),
                 },
             )
 
@@ -525,16 +452,16 @@ def main():
     z = np.linspace(0.0, lz, len(x))
 
     # Train
-    model, B0 = train(b0_grid=b0,  lx=lx,  ly=ly,  lz=lz,  z=z,  device=device,  run_dir=run_dir,)
+    model, B0 = train(b0_grid=b0,  lx=lx,  ly=ly,  lz=lz,  device=device,  run_dir=run_dir,)
 
-    _, _, bz = evaluate_field(model,  x / lx,  y / ly,  z / lz,  device=device,)
+    _, _, bz = evaluate_field(model,  x / lx,  y / lx,  z / lx,  device=device,)
 
     bz = B0 * bz
 
-    _, bx_ref, by_ref, bz_ref = (solve_potential_field_fft_cartesian_at_z(b0_grid=b0,  lx=lx,  ly=ly,  lz=lz,  z=z,))
+    _, bx_ref, by_ref, bz_ref = (solve_potential_field_fft_cartesian_at_z(b0_grid=b0.T,  lx=lx,  ly=ly,  lz=lz,  z=z,))
 
 
-    jxb_abs, div_b = evaluate_residuals(model,  x / lx,  y / ly,  z / lz,  device=device,)
+    jxb_abs, div_b = evaluate_residuals(model,  x / lx,  y / lx,  z / lx,  device=device,)
     jxb_abs = B0 * jxb_abs
     div_b = B0 * div_b
 
@@ -543,8 +470,8 @@ def main():
 
     # plot bottom Bz
     ax = axs[0, 0]
-    im = ax.pcolormesh(x, y, bz[:, :, 0].numpy().T, shading="auto")
-    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8, vmin = -1, vmax = 1)
+    im = ax.pcolormesh(x, y, bz[:, :, 0].numpy().T, shading="auto", vmin = -1, vmax = 1)
+    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8)
     cb.set_label("Bz at z=0", labelpad=4)
     cb.ax.xaxis.set_ticks_position("top")
     ax.set_xlabel("x")
@@ -573,8 +500,8 @@ def main():
 
     # plot potential reference top Bz
     ax = axs[1, 1]
-    im = ax.pcolormesh(x, y, bz_ref[:, :, -1].T, shading="auto")
-    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8, vmin = -0.0003, vmax = 0.0003)
+    im = ax.pcolormesh(x, y, bz_ref[:, :, -1].T, shading="auto", vmin = -0.0003, vmax = 0.0003)
+    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8)
     cb.set_label("Bz (potential FFT) at z=Lz", labelpad=4)
     cb.ax.xaxis.set_ticks_position("top")
     ax.set_xlabel("x")
@@ -617,7 +544,7 @@ if __name__ == "__main__":
     lx, ly, x, y, b0 = make_multimode_bottom_bz()
     lz = lx
     z = np.linspace(0.0, lz, len(x))
-    _, bx_ref, by_ref, bz_ref = solve_potential_field_fft_cartesian_at_z(b0_grid=b0, lx=lx, ly=ly, lz=lz, z=z)
+    _, bx_ref, by_ref, bz_ref = solve_potential_field_fft_cartesian_at_z(b0_grid=b0.T, lx=lx, ly=ly, lz=lz, z=z)
     mid_z = len(z) // 2
 
     fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(7, 11), constrained_layout=True)
@@ -632,8 +559,8 @@ if __name__ == "__main__":
 
     # Potential reference Bz at middle z
     ax = axs[1]
-    im = ax.pcolormesh(x, y, bz_ref[:, :, mid_z].T, shading="auto")
-    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8, vmin = -0.01, vmax = 0.01)
+    im = ax.pcolormesh(x, y, bz_ref[:, :, mid_z].T, shading="auto", vmin = -0.01, vmax = 0.01)
+    cb = fig.colorbar(im, ax=ax, location="top", pad=0.08, shrink=0.8)
     cb.set_label("Bz (potential FFT) at middle z", labelpad=4)
     cb.ax.xaxis.set_ticks_position("top")
     ax.set_xlabel("x")
